@@ -1039,6 +1039,7 @@ xcb::atoms_struct! {
         wl_surface_serial => b"WL_SURFACE_SERIAL" only_if_exists = false,
         wm_protocols => b"WM_PROTOCOLS" only_if_exists = false,
         wm_delete_window => b"WM_DELETE_WINDOW" only_if_exists = false,
+        wm_take_focus => b"WM_TAKE_FOCUS" only_if_exists = false,
         wm_transient_for => b"WM_TRANSIENT_FOR" only_if_exists = false,
         wm_state => b"WM_STATE" only_if_exists = false,
         wm_s0 => b"WM_S0" only_if_exists = false,
@@ -1343,6 +1344,81 @@ impl RealConnection {
     fn root_window(&self) -> x::Window {
         self.connection.get_setup().roots().next().unwrap().root()
     }
+
+    /// Determine the ICCCM focus model for a window.
+    /// Returns (wants_input, supports_take_focus) per ICCCM 4.1.7.
+    fn get_focus_model(&self, window: x::Window) -> (bool, bool) {
+        // Read WM_HINTS to get the input flag
+        // Default is True (wants input) if not specified
+        let wants_input = self
+            .connection
+            .wait_for_reply(self.connection.send_request(&x::GetProperty {
+                window,
+                delete: false,
+                property: x::ATOM_WM_HINTS,
+                r#type: x::ATOM_WM_HINTS,
+                long_offset: 0,
+                long_length: 9,
+            }))
+            .ok()
+            .and_then(|reply| {
+                let value: &[u32] = reply.value();
+                if value.len() >= 2 {
+                    Some(WmHints::from(value))
+                } else {
+                    None
+                }
+            })
+            .map(|hints| hints.acquire_input_via_wm)
+            .unwrap_or(true); // Default: input=True per ICCCM
+
+        // Read WM_PROTOCOLS to check for WM_TAKE_FOCUS
+        let supports_take_focus = self
+            .connection
+            .wait_for_reply(self.connection.send_request(&x::GetProperty {
+                window,
+                delete: false,
+                property: self.atoms.wm_protocols,
+                r#type: x::ATOM_ATOM,
+                long_offset: 0,
+                long_length: 10,
+            }))
+            .ok()
+            .map(|reply| reply.value::<x::Atom>().contains(&self.atoms.wm_take_focus))
+            .unwrap_or(false);
+
+        trace!(
+            "focus model for {window:?}: wants_input={wants_input}, supports_take_focus={supports_take_focus}"
+        );
+        (wants_input, supports_take_focus)
+    }
+
+    /// Send a WM_TAKE_FOCUS client message to a window (ICCCM 4.1.7).
+    fn send_wm_take_focus(&self, window: x::Window) {
+        let data = [
+            self.atoms.wm_take_focus.resource_id(),
+            x::CURRENT_TIME,
+            0,
+            0,
+            0,
+        ];
+        let event = &x::ClientMessageEvent::new(
+            window,
+            self.atoms.wm_protocols,
+            x::ClientMessageData::Data32(data),
+        );
+
+        if let Err(e) = self.connection.send_and_check_request(&x::SendEvent {
+            destination: x::SendEventDest::Window(window),
+            propagate: false,
+            event_mask: x::EventMask::empty(),
+            event,
+        }) {
+            debug!("Failed to send WM_TAKE_FOCUS to {window:?}: {e:?}");
+        } else {
+            debug!("Sent WM_TAKE_FOCUS to {window:?}");
+        }
+    }
 }
 
 impl XConnection for RealConnection {
@@ -1391,31 +1467,72 @@ impl XConnection for RealConnection {
 
     fn focus_window(&mut self, window: x::Window, output_name: Option<String>) {
         trace!("{window:?} {output_name:?}");
-        if let Err(e) = self.connection.send_and_check_request(&x::SetInputFocus {
-            focus: window,
-            revert_to: x::InputFocus::None,
-            time: x::CURRENT_TIME,
-        }) {
-            debug!("SetInputFocus failed ({window:?}: {e:?})");
-            return;
-        }
-        if let Err(e) = self.connection.send_and_check_request(&x::ChangeProperty {
-            mode: x::PropMode::Replace,
-            window: self.root_window(),
-            property: self.atoms.active_win,
-            r#type: x::ATOM_WINDOW,
-            data: &[window],
-        }) {
-            debug!("ChangeProperty failed ({window:?}: {e:?})");
-        }
-        if let Err(e) = self.connection.send_and_check_request(&x::ChangeProperty {
-            mode: x::PropMode::Replace,
-            window,
-            property: self.atoms.wm_state,
-            r#type: self.atoms.wm_state,
-            data: &[WmState::Normal as u32, 0],
-        }) {
-            debug!("ChangeProperty failed ({window:?}: {e:?})");
+
+        // For unfocus (WINDOW_NONE), just clear focus directly
+        if window.is_none() {
+            if let Err(e) = self.connection.send_and_check_request(&x::SetInputFocus {
+                focus: window,
+                revert_to: x::InputFocus::PointerRoot,
+                time: x::CURRENT_TIME,
+            }) {
+                debug!("SetInputFocus(None) failed: {e:?}");
+            }
+            if let Err(e) = self.connection.send_and_check_request(&x::ChangeProperty {
+                mode: x::PropMode::Replace,
+                window: self.root_window(),
+                property: self.atoms.active_win,
+                r#type: x::ATOM_WINDOW,
+                data: &[window],
+            }) {
+                debug!("ChangeProperty failed: {e:?}");
+            }
+            // Output handling continues below
+        } else {
+            // Determine focus model per ICCCM 4.1.7:
+            // - input=True,  WM_TAKE_FOCUS absent  -> Passive:         SetInputFocus only
+            // - input=True,  WM_TAKE_FOCUS present -> Locally Active:  SetInputFocus + WM_TAKE_FOCUS
+            // - input=False, WM_TAKE_FOCUS present -> Globally Active: WM_TAKE_FOCUS only (no SetInputFocus)
+            // - input=False, WM_TAKE_FOCUS absent  -> No Input:        do nothing
+            let (wants_input, supports_take_focus) = self.get_focus_model(window);
+
+            if !wants_input && !supports_take_focus {
+                debug!("window {window:?} does not accept focus (No Input model)");
+                return;
+            }
+
+            if wants_input {
+                if let Err(e) = self.connection.send_and_check_request(&x::SetInputFocus {
+                    focus: window,
+                    revert_to: x::InputFocus::PointerRoot,
+                    time: x::CURRENT_TIME,
+                }) {
+                    debug!("SetInputFocus failed ({window:?}: {e:?})");
+                    return;
+                }
+            }
+
+            if supports_take_focus {
+                self.send_wm_take_focus(window);
+            }
+
+            if let Err(e) = self.connection.send_and_check_request(&x::ChangeProperty {
+                mode: x::PropMode::Replace,
+                window: self.root_window(),
+                property: self.atoms.active_win,
+                r#type: x::ATOM_WINDOW,
+                data: &[window],
+            }) {
+                debug!("ChangeProperty failed ({window:?}: {e:?})");
+            }
+            if let Err(e) = self.connection.send_and_check_request(&x::ChangeProperty {
+                mode: x::PropMode::Replace,
+                window,
+                property: self.atoms.wm_state,
+                r#type: self.atoms.wm_state,
+                data: &[WmState::Normal as u32, 0],
+            }) {
+                debug!("ChangeProperty failed ({window:?}: {e:?})");
+            }
         }
 
         if let Some(name) = output_name {
