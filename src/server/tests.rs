@@ -1,7 +1,7 @@
 use super::{InnerServerState, NoConnection, ServerState, WindowDims, selection::Clipboard};
 use crate::server::selection::{Primary, SelectionType};
 use crate::xstate::{SetState, WinSize, WmName};
-use crate::{XConnection, timespec_from_millis};
+use crate::{InputModel, XConnection, timespec_from_millis};
 use rustix::event::{PollFd, PollFlags, poll};
 use std::collections::HashMap;
 use std::io::Write;
@@ -160,6 +160,9 @@ struct WindowData {
 #[derive(Default)]
 struct FakeXConnection {
     focused_window: Option<Window>,
+    last_input_model: Option<InputModel>,
+    focus_calls: usize,
+    primary_output_calls: usize,
     windows: HashMap<Window, WindowData>,
     set_window_dims_counter: usize,
 }
@@ -226,12 +229,27 @@ impl super::XConnection for FakeXConnection {
     }
 
     #[track_caller]
-    fn focus_window(&mut self, window: Window, _output_name: Option<String>) {
-        assert!(
-            self.windows.contains_key(&window),
-            "Unknown window: {window:?}"
-        );
-        self.focused_window = window.into();
+    fn focus_window(
+        &mut self,
+        window: Window,
+        _output_name: Option<String>,
+        input_model: InputModel,
+    ) {
+        self.focused_window = if window == x::WINDOW_NONE {
+            None
+        } else {
+            assert!(
+                self.windows.contains_key(&window),
+                "Unknown window: {window:?}"
+            );
+            Some(window)
+        };
+        self.last_input_model = Some(input_model);
+        self.focus_calls += 1;
+    }
+
+    fn set_primary_output(&mut self, _: Window, _: Option<String>) {
+        self.primary_output_calls += 1;
     }
 
     fn raise_to_top(&mut self, window: Window) {
@@ -1745,6 +1763,78 @@ fn popup_no_focus_input_hint_wm_take_focus() {
     f.run();
 
     assert_eq!(f.connection().focused_window, Some(win_toplevel));
+}
+
+#[test]
+fn icccm_input_model_from_hints() {
+    let model = |acquire_input_via_wm, has_take_focus| {
+        super::WindowAttributes {
+            acquire_input_via_wm,
+            has_take_focus,
+            ..Default::default()
+        }
+        .input_model()
+    };
+
+    assert_eq!(model(false, false), InputModel::NoInput);
+    assert_eq!(model(true, false), InputModel::Passive);
+    assert_eq!(model(true, true), InputModel::LocallyActive);
+    assert_eq!(model(false, true), InputModel::GloballyActive);
+    // Windows that never sent hints must keep being focused.
+    assert_eq!(
+        super::WindowAttributes::default().input_model(),
+        InputModel::NoInput
+    );
+}
+
+#[test]
+fn focus_reports_input_model() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, window);
+    assert_eq!(f.connection().last_input_model, Some(InputModel::NoInput));
+
+    f.satellite.set_win_hints(
+        window,
+        super::WmHints {
+            window_group: None,
+            acquire_input_via_wm: true,
+        },
+    );
+    f.satellite.set_take_focus(window, true);
+    f.testwl.unfocus_toplevel();
+    f.run();
+    f.testwl.focus_toplevel(id);
+    f.run();
+    assert_eq!(
+        f.connection().last_input_model,
+        Some(InputModel::LocallyActive)
+    );
+}
+
+/// Changing outputs must only move the primary output, never re-offer focus:
+/// a WM_TAKE_FOCUS there would tell the client to grab focus out of nowhere.
+#[test]
+fn output_change_does_not_refocus() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    f.new_output(0, 0);
+    let (_, output) = f.new_output(500, 100);
+    f.run();
+
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, window);
+    let focus_calls = f.connection().focus_calls;
+    let primary_output_calls = f.connection().primary_output_calls;
+
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+
+    assert_eq!(f.connection().focus_calls, focus_calls);
+    assert_eq!(
+        f.connection().primary_output_calls,
+        primary_output_calls + 1
+    );
 }
 
 #[track_caller]

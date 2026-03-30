@@ -226,7 +226,7 @@ impl SurfaceEvents {
                     if state.last_focused_toplevel == Some(*window) {
                         let output = get_output_name(Some(&on_output), &state.world);
                         debug!("focused window changed outputs - resetting primary output");
-                        connection.focus_window(*window, output);
+                        connection.set_primary_output(*window, output);
                     }
 
                     if state.fractional_scale.is_none() {

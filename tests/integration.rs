@@ -18,7 +18,7 @@ use wayland_server::Resource;
 use wayland_server::protocol::{wl_output, wl_pointer};
 use xcb::{Xid, x};
 use xwayland_satellite as xwls;
-use xwayland_satellite::xstate::{MoveResizeDirection, WmSizeHintsFlags, WmState};
+use xwayland_satellite::xstate::{MoveResizeDirection, WmHintsFlags, WmSizeHintsFlags, WmState};
 use xwls::timespec_from_millis;
 
 #[derive(Default)]
@@ -375,6 +375,7 @@ xcb::atoms_struct! {
         xsettings => b"_XSETTINGS_S0",
         xsettings_setting => b"_XSETTINGS_SETTINGS",
         moveresize => b"_NET_WM_MOVERESIZE",
+        wm_take_focus => b"WM_TAKE_FOCUS",
     }
 }
 
@@ -2347,5 +2348,130 @@ fn client_init_resize() {
         matches!(data.resizing, Some(xdg_toplevel::ResizeEdge::BottomRight)),
         "Got wrong resizing edge: {:?}",
         data.resizing
+    );
+}
+
+/// Sets WM_HINTS with only the input flag meaningful.
+fn set_input_hint(connection: &Connection, window: x::Window, input: bool) {
+    connection.set_property(
+        window,
+        x::ATOM_WM_HINTS,
+        x::ATOM_WM_HINTS,
+        &[
+            WmHintsFlags::Input.bits(),
+            input as u32,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ],
+    );
+}
+
+fn advertise_take_focus(connection: &Connection, window: x::Window) {
+    connection.set_property(
+        window,
+        x::ATOM_ATOM,
+        connection.atoms.wm_protocols,
+        &[connection.atoms.wm_take_focus],
+    );
+}
+
+/// Drains pending events, reporting whether a WM_TAKE_FOCUS message showed up.
+#[track_caller]
+fn got_take_focus(connection: &mut Connection) -> bool {
+    std::thread::sleep(Duration::from_millis(100));
+    let take_focus = connection.atoms.wm_take_focus.resource_id();
+    let wm_protocols = connection.atoms.wm_protocols;
+    let mut got = false;
+    while let Some(event) = connection.poll_for_event().expect("Failed to poll") {
+        let xcb::Event::X(x::Event::ClientMessage(event)) = event else {
+            continue;
+        };
+        if event.r#type() != wm_protocols {
+            continue;
+        }
+        if let x::ClientMessageData::Data32(data) = event.data() {
+            if data[0] == take_focus {
+                assert_eq!(event.format(), 32);
+                got = true;
+            }
+        }
+    }
+    got
+}
+
+/// ICCCM 4.1.7 passive model: the WM assigns focus, no WM_TAKE_FOCUS.
+#[test]
+fn input_model_passive() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+    let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    set_input_hint(&connection, window, true);
+    f.map_as_toplevel(&mut connection, window);
+
+    assert!(!got_take_focus(&mut connection));
+    assert_eq!(
+        connection.get_reply(&x::GetInputFocus {}).focus(),
+        window,
+        "passive clients must be given focus"
+    );
+}
+
+/// ICCCM 4.1.7 locally active model: the WM assigns focus and sends WM_TAKE_FOCUS.
+#[test]
+fn input_model_locally_active() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+    let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    set_input_hint(&connection, window, true);
+    advertise_take_focus(&connection, window);
+    f.map_as_toplevel(&mut connection, window);
+
+    assert!(got_take_focus(&mut connection));
+    assert_eq!(
+        connection.get_reply(&x::GetInputFocus {}).focus(),
+        window,
+        "locally active clients must be given focus"
+    );
+}
+
+/// ICCCM 4.1.7 globally active model: the client takes focus itself, so the WM
+/// only offers it via WM_TAKE_FOCUS.
+#[test]
+fn input_model_globally_active() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+    let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    set_input_hint(&connection, window, false);
+    advertise_take_focus(&connection, window);
+    f.map_as_toplevel(&mut connection, window);
+
+    assert!(got_take_focus(&mut connection));
+    assert_ne!(
+        connection.get_reply(&x::GetInputFocus {}).focus(),
+        window,
+        "globally active clients must assign focus themselves"
+    );
+}
+
+/// No Input clients get no WM_TAKE_FOCUS. We still focus them, as they have no
+/// other way of receiving keyboard input.
+#[test]
+fn input_model_no_input() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+    let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    set_input_hint(&connection, window, false);
+    f.map_as_toplevel(&mut connection, window);
+
+    assert!(!got_take_focus(&mut connection));
+    assert_eq!(
+        connection.get_reply(&x::GetInputFocus {}).focus(),
+        window,
+        "no input clients keep being focused"
     );
 }

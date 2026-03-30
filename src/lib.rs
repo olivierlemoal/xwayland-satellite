@@ -14,12 +14,33 @@ use std::process::{Command, ExitStatus, Stdio};
 use wayland_server::{Display, ListeningSocket};
 use xcb::x;
 
+/// ICCCM 4.1.7 input model, resolved from a window's WM_HINTS/WM_PROTOCOLS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputModel {
+    /// input=False, no WM_TAKE_FOCUS.
+    NoInput,
+    /// input=True, no WM_TAKE_FOCUS. Also the default when hints are missing.
+    #[default]
+    Passive,
+    /// input=True + WM_TAKE_FOCUS.
+    LocallyActive,
+    /// input=False + WM_TAKE_FOCUS: the client assigns focus itself.
+    GloballyActive,
+}
+
 pub trait XConnection: Sized + 'static {
     type X11Selection: X11Selection;
 
     fn set_window_dims(&mut self, window: x::Window, dims: PendingSurfaceState) -> bool;
     fn set_fullscreen(&mut self, window: x::Window, fullscreen: bool);
-    fn focus_window(&mut self, window: x::Window, output_name: Option<String>);
+    fn focus_window(
+        &mut self,
+        window: x::Window,
+        output_name: Option<String>,
+        input_model: InputModel,
+    );
+    /// Make the output a window sits on the primary one, without touching focus.
+    fn set_primary_output(&mut self, window: x::Window, output_name: Option<String>);
     fn close_window(&mut self, window: x::Window);
     fn unmap_window(&mut self, window: x::Window);
     fn raise_to_top(&mut self, window: x::Window);

@@ -10,7 +10,7 @@ use self::event::*;
 use crate::xstate::{
     Decorations, MoveResizeDirection, WindowDims, WindowRole, WmHints, WmName, WmNormalHints,
 };
-use crate::{X11Selection, XConnection, timespec_from_millis};
+use crate::{InputModel, X11Selection, XConnection, timespec_from_millis};
 use clientside::MyWorld;
 use decoration::{DecorationsData, DecorationsDataSatellite};
 use hecs::Entity;
@@ -114,9 +114,18 @@ struct WindowAttributes {
 }
 
 impl WindowAttributes {
-    /// AKA "Passive" input model
+    /// Classify the window per ICCCM 4.1.7.
+    fn input_model(&self) -> InputModel {
+        match (self.acquire_input_via_wm, self.has_take_focus) {
+            (false, false) => InputModel::NoInput,
+            (true, false) => InputModel::Passive,
+            (true, true) => InputModel::LocallyActive,
+            (false, true) => InputModel::GloballyActive,
+        }
+    }
+
     fn require_wm_focus(&self) -> bool {
-        self.acquire_input_via_wm && !self.has_take_focus
+        self.input_model() == InputModel::Passive
     }
 }
 
@@ -419,8 +428,11 @@ pub struct NoConnection<S: X11Selection + 'static> {
 }
 impl<S: X11Selection> XConnection for NoConnection<S> {
     type X11Selection = S;
-    fn focus_window(&mut self, _: x::Window, _: Option<String>) {
+    fn focus_window(&mut self, _: x::Window, _: Option<String>, _: InputModel) {
         debug!("could not focus window without XWayland initialized");
+    }
+    fn set_primary_output(&mut self, _: x::Window, _: Option<String>) {
+        debug!("could not set primary output without XWayland initialized");
     }
     fn close_window(&mut self, _: x::Window) {
         debug!("could not close window without XWayland initialized");
@@ -748,12 +760,15 @@ impl<C: XConnection> ServerState<C> {
                     "focusing {} {window:?}",
                     if is_popup { "popup" } else { "window" }
                 );
-                self.connection.focus_window(window, output_name);
+                let input_model = self.input_model(window);
+                self.connection
+                    .focus_window(window, output_name, input_model);
                 if !is_popup {
                     self.last_focused_toplevel = Some(window);
                 }
             } else if self.unfocus {
-                self.connection.focus_window(x::WINDOW_NONE, None);
+                self.connection
+                    .focus_window(x::WINDOW_NONE, None, InputModel::default());
             }
             self.unfocus = false;
         }
@@ -980,6 +995,15 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
 
         let attrs = &mut self.world.get::<&mut WindowData>(id).unwrap().attrs;
         attrs.has_take_focus = has_take_focus;
+    }
+
+    /// Resolve a window's ICCCM input model from cached hints.
+    pub fn input_model(&self, window: x::Window) -> InputModel {
+        self.windows
+            .get(&window)
+            .and_then(|&id| self.world.get::<&WindowData>(id).ok())
+            .map(|data| data.attrs.input_model())
+            .unwrap_or_default()
     }
 
     pub fn set_size_hints(&mut self, window: x::Window, hints: WmNormalHints) {
