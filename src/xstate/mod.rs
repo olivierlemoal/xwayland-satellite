@@ -1421,11 +1421,12 @@ impl XConnection for RealConnection {
             InputModel::GloballyActive => (false, true),
         };
 
-        // window is WINDOW_NONE when unfocusing, which clears the input focus.
+        // window is WINDOW_NONE when unfocusing, which clears the input focus. In
+        // that case revert_to is ignored by the server.
         if assign_focus {
             if let Err(e) = self.connection.send_and_check_request(&x::SetInputFocus {
                 focus: window,
-                revert_to: x::InputFocus::None,
+                revert_to: x::InputFocus::PointerRoot,
                 time: x::CURRENT_TIME,
             }) {
                 debug!("SetInputFocus failed ({window:?}: {e:?})");
